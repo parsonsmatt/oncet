@@ -1,14 +1,15 @@
 {-# language BlockArguments #-}
+{-# language LambdaCase #-}
 
 import Data.List (partition)
 import Test.Hspec
 import Control.Monad.Trans.Once
-import Control.Concurrent
+import Control.Concurrent.STM (check)
 import Data.Traversable
 import Control.Monad
 import Data.Foldable
-import Control.Concurrent.Async
-import Control.Concurrent.STM
+import Control.Monad.IO.Class
+import UnliftIO
 
 main :: IO ()
 main = hspec spec
@@ -28,6 +29,19 @@ newOnceVar = OnceVar <$> newEmptyMVar
 readOnceVar :: OnceVar a -> IO (Maybe a)
 readOnceVar (OnceVar a) = tryReadMVar a
 
+shouldBeUnwritten :: HasCallStack => (Show a, Eq a) => OnceVar a -> IO ()
+shouldBeUnwritten a = readOnceVar a `shouldReturn` Nothing
+
+shouldBeWritten :: HasCallStack => (Show a, Eq a) => OnceVar a -> IO ()
+shouldBeWritten a = do
+    mval <- readOnceVar a
+    mval `shouldSatisfy` \case
+        Just _ -> True
+        Nothing -> False
+
+unsafeRunOnceT :: OnceT IO a -> IO a
+unsafeRunOnceT = unsafeRunOnceTWith (OnceOpts (UnliftIO id) UnsafeDoNotEvaluate)
+
 spec :: Spec
 spec = describe "OnceT" do
     it "actions are run at most once" do
@@ -36,7 +50,7 @@ spec = describe "OnceT" do
                 putOnceVar a ()
                 pure "hello"
         result <-
-            runOnceT do
+            unsafeRunOnceT do
                 declare firstAction
         readOnceVar a `shouldReturn` Nothing
         result `shouldBe` "hello"
@@ -48,7 +62,7 @@ spec = describe "OnceT" do
         written <- newOnceVar
 
         result <-
-            runOnceT do
+            unsafeRunOnceT do
                 a <- declare do
                     putOnceVar unwritten ()
                     pure "hello"
@@ -70,7 +84,7 @@ spec = describe "OnceT" do
         onceVars <- replicateM 10 newOnceVar
         let indexedOnceVars = zip [0..] onceVars
         result <-
-            runOnceT do
+            unsafeRunOnceT do
                 for indexedOnceVars \(i, var) -> do
                     declare do
                         putOnceVar var ()
@@ -108,10 +122,9 @@ spec = describe "OnceT" do
         it "does not run twice" do
             var <- newOnceVar
             result <-
-                runOnceT do
+                unsafeRunOnceT do
                     declare do
                         putOnceVar var ()
-                        putStrLn "fibs only once"
                         pure (slowFib 35)
             goVar <- newTVarIO False
 
@@ -130,6 +143,29 @@ spec = describe "OnceT" do
                 result `shouldBe` 9227465
                 len1 `shouldBe` "9227465"
                 len2 `shouldBe` "9227465"
+
+    describe "MonadIO behavior" do
+        it "does not perform side effects if result is not demanded" do
+            willBeWritten <- newOnceVar
+            won'tBeWritten <- newOnceVar
+            result <-
+                unsafeRunOnceT do
+                    a <- declare do
+                        putOnceVar willBeWritten ()
+                        pure 10
+
+                    liftIO do
+                        putOnceVar won'tBeWritten ()
+
+                    pure a
+
+            shouldBeUnwritten willBeWritten
+            shouldBeUnwritten won'tBeWritten
+
+            result `shouldBe` 10
+
+            shouldBeWritten willBeWritten
+            shouldBeUnwritten won'tBeWritten
 
 slowFib :: Int -> Int
 slowFib 0 = 0
